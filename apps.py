@@ -1,6 +1,10 @@
 # app.py
-# Streamlit app: Drive → Multi-Channel YouTube Scheduler + Calendar (Unlimited)
-# Fixed: safe rerun handling (no infinite loops). Triggers rerun only after explicit user actions.
+# Production-ready Streamlit app: Drive -> Multi-Channel YouTube Scheduler + Calendar
+# - Production web-redirect OAuth (no run_local_server)
+# - Multi-user, multi-channel, cross-channel uploads
+# - Thumbnail selection (JPEG/PNG) from Drive
+# - Calendar events + CSV export
+# - SQLite persistence
 
 import os
 import json
@@ -8,12 +12,14 @@ import sqlite3
 import tempfile
 import hashlib
 import binascii
+import io
+import csv
 from datetime import datetime, date, time as dtime, timedelta, timezone
 from typing import Optional, List, Tuple
 
 import streamlit as st
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
+from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -30,33 +36,37 @@ SCOPES = [
 CLIENT_SECRET_FILE = "client_secret.json"
 DB_PATH = "scheduler.db"
 
+# Public URL for OAuth redirect. Set in env for production:
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8501").rstrip("/")
+
 # -----------------------------
-# Safe rerun helper
+# Utility: safe rerun
 # -----------------------------
 def trigger_rerun():
-    # Mark we intend to rerun (useful if needed), then call rerun.
-    # Only call this inside a user-driven action, never at module import time.
-    st.session_state["_triggered_rerun"] = True
-    st.rerun()
+    # Use st.rerun() (Streamlit >=1.27)
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 # -----------------------------
-# Simple PBKDF2 password hashing
+# Password hashing (PBKDF2)
 # -----------------------------
-def hash_password(password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
-    if salt is None:
-        salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return salt, dk
+def hash_password(password: str) -> Tuple[str, str]:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return binascii.hexlify(salt).decode(), binascii.hexlify(dk).decode()
 
-def verify_password(password: str, salt: bytes, dk: bytes) -> bool:
-    check = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return binascii.hexlify(check) == binascii.hexlify(dk)
+def verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
+    salt = binascii.unhexlify(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return binascii.hexlify(dk).decode() == hash_hex
 
 # -----------------------------
-# Database helpers
+# DB helpers
 # -----------------------------
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -70,59 +80,56 @@ def init_db():
             salt TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS channels (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER NOT NULL,
-          label TEXT NOT NULL,
-          channel_id TEXT,
-          channel_title TEXT,
-          token_json TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        );
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            channel_id TEXT,
+            channel_title TEXT,
+            token_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS schedules (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          channel_id INTEGER NOT NULL,
-          drive_file_id TEXT NOT NULL,
-          drive_file_name TEXT NOT NULL,
-          title TEXT NOT NULL,
-          description TEXT,
-          tags TEXT,
-          category_id TEXT,
-          made_for_kids INTEGER NOT NULL DEFAULT 0,
-          publish_at_utc TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'queued',
-          youtube_video_id TEXT,
-          calendar_event_id TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT,
-          FOREIGN KEY(channel_id) REFERENCES channels(id)
-        );
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            drive_file_id TEXT NOT NULL,
+            drive_file_name TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            tags TEXT,
+            category_id TEXT,
+            made_for_kids INTEGER NOT NULL DEFAULT 0,
+            thumbnail_file_id TEXT,
+            publish_at_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            youtube_video_id TEXT,
+            calendar_event_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            FOREIGN KEY(channel_id) REFERENCES channels(id)
+        )
     """)
     conn.commit()
     conn.close()
 
 # -----------------------------
-# User auth functions
+# User auth
 # -----------------------------
 def create_user(username: str, password: str) -> bool:
     username = username.strip()
     if not username or not password:
         return False
     salt, dk = hash_password(password)
-    salt_hex = binascii.hexlify(salt).decode()
-    dk_hex = binascii.hexlify(dk).decode()
     conn = get_conn()
     try:
-        conn.execute(
-            "INSERT INTO users (username, salt, password_hash, created_at) VALUES (?,?,?,?)",
-            (username, salt_hex, dk_hex, datetime.utcnow().isoformat() + "Z")
-        )
+        conn.execute("INSERT INTO users (username, salt, password_hash, created_at) VALUES (?,?,?,?)",
+                     (username, salt, dk, datetime.utcnow().isoformat() + "Z"))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -136,9 +143,7 @@ def authenticate_user(username: str, password: str) -> Optional[int]:
     conn.close()
     if not row:
         return None
-    salt = binascii.unhexlify(row["salt"])
-    dk = binascii.unhexlify(row["password_hash"])
-    if verify_password(password, salt, dk):
+    if verify_password(password, row["salt"], row["password_hash"]):
         return int(row["id"])
     return None
 
@@ -156,8 +161,9 @@ def ensure_client_secret_file():
         return
     cfg = st.secrets.get("google_oauth_client") if hasattr(st, "secrets") else None
     if cfg:
+        raw = json.loads(cfg) if isinstance(cfg, str) else dict(cfg)
         with open(CLIENT_SECRET_FILE, "w", encoding="utf-8") as f:
-            json.dump(json.loads(cfg) if isinstance(cfg, str) else dict(cfg), f)
+            json.dump(raw, f)
 
 def creds_from_json(token_json: str) -> Credentials:
     return Credentials.from_authorized_user_info(json.loads(token_json), scopes=SCOPES)
@@ -165,30 +171,38 @@ def creds_from_json(token_json: str) -> Credentials:
 def creds_to_json(creds: Credentials) -> str:
     return creds.to_json()
 
-def flow_local_desktop() -> Optional[Credentials]:
-    from google_auth_oauthlib.flow import InstalledAppFlow
+def build_flow(redirect_uri: str) -> Flow:
     ensure_client_secret_file()
-    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
-    creds = flow.run_local_server(port=0, prompt="consent")
-    return creds
-
-def flow_web_redirect() -> Optional[Credentials]:
-    ensure_client_secret_file()
-    redirect_uri = os.environ.get("PUBLIC_URL") or "http://localhost:8501"
-    qp = st.experimental_get_query_params()
-    if "redirect_uri" in qp:
-        redirect_uri = qp["redirect_uri"][0]
+    # The Flow object will be created per request
     flow = Flow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes=SCOPES, redirect_uri=redirect_uri)
+    return flow
+
+def flow_get_credentials_via_redirect():
+    """
+    Web redirect flow for production:
+    - Builds Flow with redirect_uri = PUBLIC_URL + '/'
+    - If ?code= present in URL (Streamlit query params), exchanges for tokens and returns creds.
+    - Otherwise shows an authorization link for the user to click.
+    """
+    redirect_uri = PUBLIC_URL + "/"
+    qp = st.experimental_get_query_params()
+    flow = build_flow(redirect_uri)
     if "code" in qp:
+        code = qp["code"][0]
         try:
-            flow.fetch_token(code=qp["code"][0])
-            return flow.credentials
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            # clear code from URL to avoid repeated exchange
+            st.experimental_set_query_params()
+            return creds
         except Exception as e:
-            st.error(f"OAuth error: {e}")
+            st.error(f"OAuth exchange error: {e}")
             return None
-    auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
-    st.markdown(f"[Connect Google]({auth_url})")
-    return None
+    else:
+        auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+        st.markdown(f"[Authorize Google Account]({auth_url})")
+        st.info("After approval Google will redirect you back to this page. If it doesn't, copy the full redirected URL into the browser.")
+        return None
 
 # -----------------------------
 # Google service builders
@@ -220,6 +234,14 @@ def list_videos_in_folder(drive, folder_id: str, page_size: int = 1000):
     resp = drive.files().list(q=q, fields="files(id,name,mimeType,size)", pageSize=page_size).execute()
     return resp.get("files", [])
 
+def list_images_in_folder(drive, folder_id: str, page_size: int = 500):
+    q = (
+        f"'{folder_id}' in parents and trashed=false and (mimeType contains 'image/' or "
+        "name contains '.jpg' or name contains '.jpeg' or name contains '.png')"
+    )
+    resp = drive.files().list(q=q, fields="files(id,name,mimeType,size)", pageSize=page_size).execute()
+    return resp.get("files", [])
+
 def download_drive_file_to_temp(drive, file_id: str, filename: str) -> str:
     request = drive.files().get_media(fileId=file_id)
     fd, tmp_path = tempfile.mkstemp(prefix="gdrive_", suffix="_" + filename)
@@ -239,7 +261,7 @@ def download_drive_file_to_temp(drive, file_id: str, filename: str) -> str:
     return tmp_path
 
 # -----------------------------
-# YouTube helpers
+# YouTube + Calendar helpers
 # -----------------------------
 def get_channel_identity(yt):
     resp = yt.channels().list(part="snippet", mine=True).execute()
@@ -282,6 +304,15 @@ def upload_video_scheduled(yt, local_path: str, title: str, description: str, ta
         progress.progress(100)
     return response.get("id") if response else None
 
+def set_video_thumbnail(yt, video_id: str, thumbnail_path: str) -> bool:
+    try:
+        media = MediaFileUpload(thumbnail_path)
+        yt.thumbnails().set(videoId=video_id, media_body=media).execute()
+        return True
+    except HttpError as e:
+        st.warning(f"Failed to set thumbnail: {e}")
+        return False
+
 def patch_video_publish_at(yt, video_id: str, publish_at_iso: Optional[str]) -> bool:
     try:
         body = {"id": video_id, "status": {"privacyStatus": "private" if publish_at_iso else "public"}}
@@ -301,9 +332,6 @@ def delete_youtube_video(yt, video_id: str) -> bool:
         st.warning(f"Failed to delete YouTube video: {e}")
         return False
 
-# -----------------------------
-# Calendar helpers
-# -----------------------------
 def create_calendar_event(cal, publish_dt_utc: datetime, title: str, description: str) -> Optional[str]:
     start_iso = publish_dt_utc.isoformat().replace("+00:00", "Z")
     end_iso = (publish_dt_utc + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
@@ -336,7 +364,7 @@ def delete_calendar_event(cal, event_id: str) -> bool:
         return False
 
 # -----------------------------
-# DB operations for channels & schedules (user-aware)
+# DB operations (channels & schedules)
 # -----------------------------
 def add_channel_for_user(user_id: int, creds: Credentials, label_hint: Optional[str] = None):
     yt = build("youtube", "v3", credentials=creds)
@@ -365,18 +393,19 @@ def get_channel_creds(channel_id_db: int) -> Credentials:
     return creds_from_json(row["token_json"])
 
 def add_schedule_db(channel_id_db: int, drive_file_id: str, drive_file_name: str, title: str, description: str,
-                    tags_csv: str, category_id: str, made_for_kids: bool, publish_at_utc: datetime,
-                    youtube_video_id: Optional[str], calendar_event_id: Optional[str], status: str):
+                    tags_csv: str, category_id: str, made_for_kids: bool, thumbnail_file_id: Optional[str],
+                    publish_at_utc: datetime, youtube_video_id: Optional[str], calendar_event_id: Optional[str], status: str):
     conn = get_conn()
     conn.execute(
         """
         INSERT INTO schedules(channel_id, drive_file_id, drive_file_name, title, description, tags, category_id,
-                               made_for_kids, publish_at_utc, status, youtube_video_id, calendar_event_id, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               made_for_kids, thumbnail_file_id, publish_at_utc, status, youtube_video_id, calendar_event_id, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             channel_id_db, drive_file_id, drive_file_name, title, description, tags_csv, category_id,
-            1 if made_for_kids else 0, publish_at_utc.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            1 if made_for_kids else 0, thumbnail_file_id,
+            publish_at_utc.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             status, youtube_video_id, calendar_event_id, datetime.utcnow().isoformat() + "Z"
         ),
     )
@@ -409,7 +438,7 @@ def delete_schedule_db(schedule_id: int):
     conn.close()
 
 # -----------------------------
-# Time helpers
+# Time helper
 # -----------------------------
 def to_rfc3339(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -420,258 +449,294 @@ def to_rfc3339(dt: datetime) -> str:
 st.set_page_config(page_title="Drive → YouTube Scheduler", page_icon="📺", layout="wide")
 init_db()
 
+# session state defaults
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
-# track triggered rerun (optional)
-if "_triggered_rerun" not in st.session_state:
-    st.session_state["_triggered_rerun"] = False
+st.title("📺 Drive → YouTube Scheduler + Calendar (Prod-ready)")
 
-st.title("📺 Drive → Multi-Channel YouTube Scheduler + Calendar (Cross-channel)")
-
-# Authentication UI in sidebar
+# Sidebar: login/register
 with st.sidebar:
     st.header("Account • Login / Register")
     if st.session_state.user_id:
         uname = get_username(st.session_state.user_id)
         st.success(f"Signed in as: {uname}")
-        if st.button("🔓 Logout"):
+        if st.button("Logout"):
             st.session_state.user_id = None
-            # safe rerun after logout
             trigger_rerun()
     else:
-        auth_tab = st.radio("Mode", ["Login", "Register"], index=0)
-        username = st.text_input("Username", key="auth_user")
-        password = st.text_input("Password", type="password", key="auth_pass")
-        if auth_tab == "Register":
+        mode = st.radio("Mode", ["Login", "Register"], index=0)
+        username = st.text_input("Username", key="ui_username")
+        password = st.text_input("Password", type="password", key="ui_password")
+        if mode == "Register":
             if st.button("Create account"):
                 ok = create_user(username, password)
                 if ok:
                     st.success("User created — please log in.")
-                    # do NOT auto-rerun; user can switch to Login and sign in
                 else:
-                    st.error("User already exists or invalid input.")
+                    st.error("Account exists or invalid input.")
         else:
             if st.button("Sign in"):
                 uid = authenticate_user(username, password)
                 if uid:
                     st.session_state.user_id = uid
                     st.success("Signed in.")
-                    # safe rerun after successful sign-in
                     trigger_rerun()
                 else:
                     st.error("Invalid credentials.")
 
-# Require auth
+# require auth
 if not st.session_state.user_id:
-    st.info("Please register or login from the sidebar to manage accounts and schedules.")
+    st.info("Please sign in from the sidebar.")
     st.stop()
 
-# After login: manage Google account connections (per-user)
+# After login: Google accounts management
 with st.sidebar:
-    st.header("🔐 Google Accounts (per user)")
-    mode = st.radio("OAuth mode (connect)", ["Local dev (popup)", "This page redirect"], index=0, key="oauth_mode")
-    if st.button("➕ Add Google account"):
+    st.markdown("---")
+    st.header("🔐 Google Accounts")
+    st.caption("Add Google accounts to browse Drive and upload to YouTube")
+    oauth_mode = st.radio("OAuth flow", ["Web redirect (recommended)", "Local dev (popup)"], index=0)
+    if st.button("➕ Connect Google account"):
         creds = None
-        if mode == "Local dev (popup)":
-            creds = flow_local_desktop()
+        if oauth_mode == "Local dev (popup)":
+            try:
+                creds = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES).run_local_server(port=0)
+            except Exception as e:
+                st.error(f"Local OAuth failed (no browser on server): {e}")
         else:
-            creds = flow_web_redirect()
+            creds = flow_get_credentials_via_redirect()
         if creds:
-            add_channel_for_user(st.session_state.user_id, creds)
-            st.success("Google account connected")
-            trigger_rerun()
-    if st.button("🔄 Refresh accounts"):
+            try:
+                add_channel_for_user(st.session_state.user_id, creds)
+                st.success("Google account connected.")
+                trigger_rerun()
+            except Exception as e:
+                st.error(f"Failed to save channel: {e}")
+
+    if st.button("Refresh accounts"):
         trigger_rerun()
 
-# List channels for current user
+# list channels
 channels = list_channels_for_user(st.session_state.user_id)
 if not channels:
-    st.info("You have no connected Google accounts. Add one from the sidebar.")
+    st.warning("No connected Google accounts — add one from the sidebar.")
     st.stop()
 
-# Map and selection: choose source (Drive) and targets (upload destinations)
-channel_map = {f"{c['channel_title'] or c['label']} (id {c['id']})": c['id'] for c in channels}
-src_label = st.selectbox("Source account (Drive) — browse files from this account", list(channel_map.keys()))
-src_channel_db_id = channel_map[src_label]
+# Make channel map for UI choices
+channel_map = {f"{c['channel_title'] or c['label']} (db id {c['id']})": c['id'] for c in channels}
 
-# Build Drive service for source
+# Choose source and targets
+st.subheader("Select Source & Targets")
+src_choice = st.selectbox("Source account (Drive - browse files)", list(channel_map.keys()))
+src_channel_db_id = channel_map[src_choice]
+
+target_choices = st.multiselect("Target account(s) — where to upload (one or more)", list(channel_map.keys()), default=[src_choice])
+target_channel_ids = [channel_map[t] for t in target_choices]
+
+# Build source drive
 try:
     src_creds = get_channel_creds(src_channel_db_id)
+    src_drive, _, _ = build_services(src_creds)
 except Exception as e:
-    st.error(f"Failed to load source credentials: {e}")
+    st.error(f"Failed to initialize source Drive: {e}")
     st.stop()
-src_drive, _, _ = build_services(src_creds)
 
-# Targets: allow multi-select of any connected accounts (including same as source)
-target_options = list(channel_map.keys())
-target_picks = st.multiselect("Target account(s) — upload to these channels", target_options, default=[src_label])
-
-# Convert to ids
-target_channel_ids = [channel_map[t] for t in target_picks]
-
-# Tabs: Schedule / Dashboard / DB Viewer
-tab = st.tabs(["Schedule Videos (cross-channel)", "Scheduled Dashboard", "DB Viewer"])
+# Tabs
+tabs = st.tabs(["Schedule Videos", "Scheduled Dashboard", "Export CSV / DB"])
 
 # -----------------------------
 # Schedule Videos Tab
 # -----------------------------
-with tab[0]:
-    st.subheader("Pick Drive folder from Source account")
+with tabs[0]:
+    st.header("Pick folder in Source Drive")
     try:
         root_folders = list_folders(src_drive)
     except HttpError as e:
         st.error(f"Drive API error: {e}")
-        st.stop()
+        root_folders = []
 
     folder_map = {f["name"]: f["id"] for f in root_folders}
     if not folder_map:
-        st.info("No folders in Drive root for this account.")
-        st.stop()
-    picked = st.selectbox("Root folders", list(folder_map.keys()))
-    current_folder = folder_map[picked]
+        st.info("No folders found in Drive root for this account.")
+    else:
+        picked = st.selectbox("Root folders", list(folder_map.keys()))
+        current_folder = folder_map[picked]
+        subs = list_folders(src_drive, parent_id=current_folder)
+        if subs:
+            sub_map = {f["name"]: f["id"] for f in subs}
+            sel2 = st.selectbox("Subfolders (optional)", ["(none)"] + list(sub_map.keys()))
+            if sel2 != "(none)":
+                current_folder = sub_map[sel2]
 
-    subs = list_folders(src_drive, parent_id=current_folder)
-    if subs:
-        sub_map = {f["name"]: f["id"] for f in subs}
-        sel2 = st.selectbox("Subfolders", ["(none)"] + list(sub_map.keys()))
-        if sel2 != "(none)":
-            current_folder = sub_map[sel2]
-    st.caption(f"Folder ID (source): {current_folder}")
+        st.caption(f"Folder ID: {current_folder}")
 
-    st.subheader("Select videos from Source Drive & schedule (within 30 days)")
-    try:
-        videos = list_videos_in_folder(src_drive, current_folder)
-    except HttpError as e:
-        st.error(f"Drive API error: {e}")
-        st.stop()
-    if not videos:
-        st.warning("No videos found in this folder.")
-        st.stop()
+        # videos
+        try:
+            videos = list_videos_in_folder(src_drive, current_folder)
+        except HttpError as e:
+            st.error(f"Drive API error: {e}")
+            videos = []
 
-    label_map = {f"{v['name']} ({int(v.get('size','0'))/1e6:.1f} MB)": v for v in videos}
-    picks = st.multiselect("Pick videos (no limit)", list(label_map.keys()))
-
-    st.markdown("---")
-    st.write("Default metadata (applies to items; override per video below):")
-    default_title_prefix = st.text_input("Title prefix", value="")
-    default_description = st.text_area("Description", value="Uploaded via scheduler", height=80)
-    default_tags_str = st.text_input("Tags (comma)", value="streamlit,scheduler")
-    default_tags = [t.strip() for t in default_tags_str.split(",") if t.strip()]
-    category = st.selectbox("Category", [
-        ("22", "People & Blogs"), ("24", "Entertainment"), ("28", "Science & Technology"),
-        ("27", "Education"), ("1", "Film & Animation"), ("10", "Music")
-    ], format_func=lambda x: x[1])
-    kids = st.checkbox("Made for kids", value=False)
-
-    today = date.today()
-    max_day = today + timedelta(days=30)
-
-    per_video_inputs = []
-    for lbl in picks:
-        v = label_map[lbl]
-        with st.expander(f"⏱ {v['name']}"):
-            vtitle = st.text_input(f"Title for {v['name']}", value=(default_title_prefix + os.path.splitext(v["name"])[0])[:95], key=f"t_{v['id']}")
-            vdesc = st.text_area(f"Description for {v['name']}", value=default_description, height=80, key=f"d_{v['id']}")
-            vtags_str = st.text_input(f"Tags for {v['name']}", value=default_tags_str, key=f"g_{v['id']}")
-            vtags = [t.strip() for t in vtags_str.split(",") if t.strip()]
-            dsel = st.date_input(f"Date for {v['name']}", value=today, min_value=today, max_value=max_day, key=f"da_{v['id']}")
-            tsel = st.time_input(f"Time for {v['name']}", value=dtime(10, 0), key=f"ti_{v['id']}")
-            per_video_inputs.append((v, vtitle, vdesc, vtags, dsel, tsel))
-
-    if st.button("📤 Schedule cross-channel uploads & create Calendar events"):
-        if not picks:
-            st.warning("Select at least one video.")
+        if not videos:
+            st.warning("No videos in this folder.")
         else:
-            # Pre-build services for target channels (to avoid repeated DB reads)
-            target_services = {}
-            for t_id in target_channel_ids:
-                try:
-                    creds = get_channel_creds(t_id)
-                    _, yt_service, cal_service = build_services(creds)
-                    target_services[t_id] = (creds, yt_service, cal_service)
-                except Exception as e:
-                    st.error(f"Failed to prepare target channel id {t_id}: {e}")
-                    target_services[t_id] = (None, None, None)
+            label_map = {f"{v['name']} ({int(v.get('size','0'))/1e6:.1f} MB)": v for v in videos}
+            picks = st.multiselect("Select videos (no limit)", list(label_map.keys()))
 
-            any_success = False
-            for (v, vtitle, vdesc, vtags, dsel, tsel) in per_video_inputs:
-                local_dt = datetime.combine(dsel, tsel).astimezone()
-                if local_dt > datetime.now().astimezone() + timedelta(days=31):
-                    st.error(f"{v['name']}: publish time must be within 31 days.")
-                    continue
-                if local_dt <= datetime.now().astimezone() + timedelta(minutes=4):
-                    st.warning(f"{v['name']}: publish time is too soon; scheduling 10 minutes from now.")
-                    local_dt = datetime.now().astimezone() + timedelta(minutes=10)
-                publish_iso = to_rfc3339(local_dt)
+            st.markdown("---")
+            st.write("Default metadata (applies to videos; override below)")
+            default_title_prefix = st.text_input("Title prefix", value="")
+            default_description = st.text_area("Description", value="Uploaded via scheduler", height=100)
+            default_tags_str = st.text_input("Tags (comma)", value="streamlit,scheduler")
+            category = st.selectbox("Category", [("22","People & Blogs"),("24","Entertainment"),("28","Science & Technology"),("27","Education"),("1","Film & Animation"),("10","Music")], format_func=lambda x: x[1])
+            kids = st.checkbox("Made for kids", value=False)
 
-                # Download once from source Drive
-                tmp_path = download_drive_file_to_temp(src_drive, v["id"], v["name"])
+            today = date.today()
+            max_day = today + timedelta(days=30)
 
-                # For each target channel, upload separately and create schedule row
-                for target_db_id, (creds, yt_service, cal_service) in target_services.items():
-                    if not creds:
-                        st.error(f"Skipping target {target_db_id} due to missing creds.")
-                        continue
-                    # Upload to target YouTube
-                    video_id = upload_video_scheduled(
-                        yt_service,
-                        local_path=tmp_path,
-                        title=vtitle,
-                        description=vdesc,
-                        tags=vtags,
-                        category_id=category[0],
-                        publish_at_iso=publish_iso,
-                        made_for_kids=kids,
-                    )
+            per_video_inputs = []
+            for lbl in picks:
+                v = label_map[lbl]
+                with st.expander(f"{v['name']}"):
+                    vtitle = st.text_input(f"Title for {v['name']}", value=(default_title_prefix + os.path.splitext(v["name"])[0])[:95], key=f"t_{v['id']}")
+                    vdesc = st.text_area(f"Description for {v['name']}", value=default_description, height=80, key=f"d_{v['id']}")
+                    vtags_str = st.text_input(f"Tags for {v['name']}", value=default_tags_str, key=f"g_{v['id']}")
+                    vtags = [t.strip() for t in vtags_str.split(",") if t.strip()]
+                    dsel = st.date_input(f"Date for {v['name']}", value=today, min_value=today, max_value=max_day, key=f"da_{v['id']}")
+                    tsel = st.time_input(f"Time for {v['name']}", value=dtime(10,0), key=f"ti_{v['id']}")
+                    # thumbnail: allow selecting image from same folder or another folder
+                    thumb_choice = st.selectbox(f"Thumbnail source for {v['name']}", ["(none)", "Pick from same folder", "Pick from another folder"], key=f"th_mode_{v['id']}")
+                    thumbnail_file_id = None
+                    if thumb_choice == "Pick from same folder":
+                        imgs = list_images_in_folder(src_drive, current_folder)
+                        if imgs:
+                            img_map = {f"{i['name']}": i for i in imgs}
+                            sel_img = st.selectbox(f"Choose image (same folder) for {v['name']}", list(img_map.keys()), key=f"img_{v['id']}")
+                            thumbnail_file_id = img_map[sel_img]['id']
+                        else:
+                            st.info("No images in this folder.")
+                    elif thumb_choice == "Pick from another folder":
+                        # pick folder then images
+                        other_folders = list_folders(src_drive)
+                        other_map = {f["name"]: f["id"] for f in other_folders}
+                        if other_map:
+                            sel_f = st.selectbox(f"Pick folder for thumbnails (for {v['name']})", ["(none)"] + list(other_map.keys()), key=f"thumb_folder_{v['id']}")
+                            if sel_f != "(none)":
+                                imgs = list_images_in_folder(src_drive, other_map[sel_f])
+                                if imgs:
+                                    img_map = {f"{i['name']}": i for i in imgs}
+                                    sel_img = st.selectbox(f"Choose image in {sel_f} for {v['name']}", list(img_map.keys()), key=f"img2_{v['id']}")
+                                    thumbnail_file_id = img_map[sel_img]['id']
+                                else:
+                                    st.info("No images in that folder.")
+                        else:
+                            st.info("No folders found.")
+                    per_video_inputs.append((v, vtitle, vdesc, vtags, dsel, tsel, thumbnail_file_id))
 
-                    cal_event_id = None
-                    if video_id:
-                        cal_event_id = create_calendar_event(cal_service, local_dt.astimezone(timezone.utc), vtitle, vdesc)
+            if st.button("📤 Schedule uploads to targets & create calendar events"):
+                if not target_channel_ids:
+                    st.warning("Pick at least one target account.")
+                else:
+                    # Prepare target services
+                    target_services = {}
+                    for t_id in target_channel_ids:
+                        try:
+                            creds = get_channel_creds(t_id)
+                            _, yt_service, cal_service = build_services(creds)
+                            target_services[t_id] = (creds, yt_service, cal_service)
+                        except Exception as e:
+                            st.error(f"Target channel {t_id} prep failed: {e}")
+                            target_services[t_id] = (None, None, None)
 
-                    add_schedule_db(
-                        channel_id_db=target_db_id,
-                        drive_file_id=v["id"],
-                        drive_file_name=v["name"],
-                        title=vtitle,
-                        description=vdesc,
-                        tags_csv=",".join(vtags),
-                        category_id=category[0],
-                        made_for_kids=kids,
-                        publish_at_utc=local_dt.astimezone(timezone.utc),
-                        youtube_video_id=video_id,
-                        calendar_event_id=cal_event_id,
-                        status="uploaded" if video_id else "failed",
-                    )
+                    any_success = False
+                    for (v, vtitle, vdesc, vtags, dsel, tsel, thumbnail_file_id) in per_video_inputs:
+                        local_dt = datetime.combine(dsel, tsel).astimezone()
+                        if local_dt > datetime.now().astimezone() + timedelta(days=31):
+                            st.error(f"{v['name']}: publish time must be within 31 days.")
+                            continue
+                        if local_dt <= datetime.now().astimezone() + timedelta(minutes=4):
+                            st.warning(f"{v['name']}: publish time too soon; scheduling 10 minutes from now.")
+                            local_dt = datetime.now().astimezone() + timedelta(minutes=10)
+                        publish_iso = to_rfc3339(local_dt)
 
-                    if video_id:
-                        any_success = True
-                        url = f"https://www.youtube.com/watch?v={video_id}"
-                        st.success(f"Scheduled {v['name']} → {url} at {publish_iso} (UTC) on channel id {target_db_id}")
-                        if cal_event_id:
-                            update_calendar_event_with_link(cal_service, cal_event_id, url)
-                    else:
-                        st.error(f"Failed to upload {v['name']} to channel id {target_db_id}")
+                        # Download video once
+                        tmp_video = download_drive_file_to_temp(src_drive, v["id"], v["name"])
 
-                # remove temp file after uploading to all targets
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                        # Download thumbnail if available to temp file
+                        tmp_thumb = None
+                        if thumbnail_file_id:
+                            # get name
+                            meta = src_drive.files().get(fileId=thumbnail_file_id, fields="name").execute()
+                            tname = meta.get("name", "thumb")
+                            tmp_thumb = download_drive_file_to_temp(src_drive, thumbnail_file_id, tname)
 
-            if any_success:
-                # only trigger rerun when something changed successfully
-                trigger_rerun()
+                        # Upload per target
+                        for tgt_id, (creds, yt_service, cal_service) in target_services.items():
+                            if not creds or not yt_service:
+                                st.error(f"Skipping target {tgt_id}: missing service")
+                                continue
+                            vid = upload_video_scheduled(
+                                yt_service,
+                                local_path=tmp_video,
+                                title=vtitle,
+                                description=vdesc,
+                                tags=vtags,
+                                category_id=category[0],
+                                publish_at_iso=publish_iso,
+                                made_for_kids=kids,
+                            )
+                            cal_event_id = None
+                            if vid:
+                                # set thumbnail if provided
+                                if tmp_thumb:
+                                    set_video_thumbnail(yt_service, vid, tmp_thumb)
+                                cal_event_id = create_calendar_event(cal_service, local_dt.astimezone(timezone.utc), vtitle, vdesc)
+                            add_schedule_db(
+                                channel_id_db=tgt_id,
+                                drive_file_id=v["id"],
+                                drive_file_name=v["name"],
+                                title=vtitle,
+                                description=vdesc,
+                                tags_csv=",".join(vtags),
+                                category_id=category[0],
+                                made_for_kids=kids,
+                                thumbnail_file_id=thumbnail_file_id,
+                                publish_at_utc=local_dt.astimezone(timezone.utc),
+                                youtube_video_id=vid,
+                                calendar_event_id=cal_event_id,
+                                status="uploaded" if vid else "failed",
+                            )
+                            if vid:
+                                any_success = True
+                                url = f"https://www.youtube.com/watch?v={vid}"
+                                st.success(f"{v['name']} scheduled to channel id {tgt_id} at {publish_iso} -> {url}")
+                                if cal_event_id:
+                                    update_calendar_event_with_link(cal_service, cal_event_id, url)
+                            else:
+                                st.error(f"Upload failed for {v['name']} to channel {tgt_id}")
+
+                        # cleanup tmp files
+                        try:
+                            os.remove(tmp_video)
+                        except Exception:
+                            pass
+                        if tmp_thumb:
+                            try:
+                                os.remove(tmp_thumb)
+                            except Exception:
+                                pass
+
+                    if any_success:
+                        trigger_rerun()
 
 # -----------------------------
-# Dashboard Tab (per-user channels)
+# Dashboard Tab
 # -----------------------------
-with tab[1]:
-    st.subheader("Scheduled Uploads Dashboard (per channel)")
-    ch_map_local = {f"{c['channel_title'] or c['label']} (id {c['id']})": c['id'] for c in channels}
+with tabs[1]:
+    st.header("Scheduled Uploads Dashboard")
+    ch_map_local = {k: v for k, v in channel_map.items()}
     view_label = st.selectbox("View schedules for channel", list(ch_map_local.keys()))
     view_channel_id = ch_map_local[view_label]
-
     rows = list_schedules(view_channel_id)
     if not rows:
         st.info("No scheduled uploads for this channel.")
@@ -680,17 +745,16 @@ with tab[1]:
             st.markdown("---")
             cols = st.columns([3, 1, 1, 1])
             with cols[0]:
-                st.markdown(f"**{r['title']}**  ")
-                st.markdown(f"File: `{r['drive_file_name']}`  ")
-                st.markdown(f"Publish (UTC): `{r['publish_at_utc']}`  ")
-                st.markdown(f"Status: `{r['status']}`  ")
+                st.markdown(f"**{r['title']}**")
+                st.write(f"File: `{r['drive_file_name']}`")
+                st.write(f"Publish (UTC): `{r['publish_at_utc']}`")
+                st.write(f"Status: `{r['status']}`")
                 if r['youtube_video_id']:
-                    st.markdown(f"Video: https://www.youtube.com/watch?v={r['youtube_video_id']}")
+                    st.write(f"Video: https://www.youtube.com/watch?v={r['youtube_video_id']}")
                 if r['calendar_event_id']:
-                    st.markdown(f"Calendar Event ID: `{r['calendar_event_id']}`")
-
+                    st.write(f"Calendar Event ID: `{r['calendar_event_id']}`")
             with cols[1]:
-                if st.button(f"Edit", key=f"edit_{r['id']}"):
+                if st.button("Edit", key=f"edit_{r['id']}"):
                     with st.form(f"form_edit_{r['id']}"):
                         new_title = st.text_input("Title", value=r['title'])
                         new_desc = st.text_area("Description", value=r['description'] or "", height=80)
@@ -708,22 +772,20 @@ with tab[1]:
                                 if r['youtube_video_id']:
                                     ok = patch_video_publish_at(yt_view, r['youtube_video_id'], publish_iso)
                                     if not ok:
-                                        st.warning("Could not patch YouTube publish time; database/calendar will still update.")
+                                        st.warning("Could not patch YouTube publish time; DB/calendar will update.")
                                 if r['calendar_event_id']:
                                     delete_calendar_event(cal_view, r['calendar_event_id'])
                                     new_cal_id = create_calendar_event(cal_view, new_dt.astimezone(timezone.utc), new_title, new_desc)
                                 else:
                                     new_cal_id = None
                                 update_schedule_db(r['id'], title=new_title, description=new_desc, tags=new_tags,
-                                                   publish_at_utc=new_dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                                                   publish_at_utc=new_dt.astimezone(timezone.utc).isoformat().replace('+00:00','Z'),
                                                    calendar_event_id=new_cal_id)
-                                # only rerun after successful edit
                                 trigger_rerun()
                             except Exception as e:
-                                st.error(f"Could not save edit: {e}")
-
+                                st.error(f"Edit failed: {e}")
             with cols[2]:
-                if st.button(f"Delete", key=f"del_{r['id']}"):
+                if st.button("Delete", key=f"del_{r['id']}"):
                     try:
                         creds_view = get_channel_creds(view_channel_id)
                         _, yt_view, cal_view = build_services(creds_view)
@@ -736,37 +798,32 @@ with tab[1]:
                         if delete_calendar_event(cal_view, r['calendar_event_id']):
                             st.info("Deleted calendar event.")
                     delete_schedule_db(r['id'])
-                    st.success("Schedule deleted")
+                    st.success("Schedule deleted.")
                     trigger_rerun()
-
             with cols[3]:
-                if st.button(f"Refresh", key=f"refresh_{r['id']}"):
+                if st.button("Refresh", key=f"ref_{r['id']}"):
                     trigger_rerun()
 
 # -----------------------------
-# DB Viewer (simple)
+# Export CSV / DB Tab
 # -----------------------------
-with tab[2]:
-    st.subheader("DB Viewer (users & your channels)")
-    conn = get_conn()
-    users = conn.execute("SELECT id, username, created_at FROM users ORDER BY id DESC").fetchall()
-    st.markdown("**Users**")
-    for u in users:
-        st.markdown(f"- `{u['id']}` • {u['username']} • created {u['created_at']}")
-    st.markdown("**Your connected channels**")
-    for c in channels:
-        st.markdown(f"- `{c['id']}` • {c['channel_title'] or c['label']} • connected {c['created_at']}")
-    conn.close()
+with tabs[2]:
+    st.header("Export Schedules / DB")
+    st.write("Export scheduled uploads for any of your connected channels.")
+    sel = st.selectbox("Select channel to export", list(channel_map.keys()))
+    cid = channel_map[sel]
+    schedules = list_schedules(cid)
+    if schedules:
+        if st.button("Export CSV"):
+            # build CSV in memory
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["id","channel_id","drive_file_id","drive_file_name","title","description","tags","category_id","made_for_kids","thumbnail_file_id","publish_at_utc","status","youtube_video_id","calendar_event_id","created_at","updated_at"])
+            for s in schedules:
+                writer.writerow([s["id"], s["channel_id"], s["drive_file_id"], s["drive_file_name"], s["title"], s["description"] or "", s["tags"] or "", s["category_id"] or "", s["made_for_kids"], s["thumbnail_file_id"] or "", s["publish_at_utc"], s["status"], s["youtube_video_id"] or "", s["calendar_event_id"] or "", s["created_at"], s["updated_at"] or ""])
+            st.download_button("Download CSV", data=buf.getvalue(), file_name=f"schedules_channel_{cid}.csv", mime="text/csv")
+    else:
+        st.info("No schedules to export for this channel.")
 
 st.markdown("---")
-st.caption("Notes: Passwords are stored locally with PBKDF2-SHA256. Channels are tied to the user that connected them. Cross-channel uploads download from the selected source Drive account and upload into each selected target channel (one DB schedule entry per target).")
-
-st.markdown("""
-### Setup checklist
-1. Enable Drive API, YouTube Data API v3, Calendar API in Google Cloud Console.
-2. Create OAuth 2.0 client (Desktop for local dev; Web for deployed) and place `client_secret.json` in the project folder or in Streamlit Secrets under `google_oauth_client`.
-3. Install deps:
-   pip install -r requirements.txt
-4. Run:
-   streamlit run app.py --server.port 8502
-""")
+st.caption("Setup checklist: ensure client_secret.json present (or set google_oauth_client in Streamlit secrets). Add the app URL to Google Cloud Console OAuth redirect URIs. Run behind a reverse proxy (Nginx) with HTTPS for best results.")
