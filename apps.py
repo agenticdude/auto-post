@@ -37,7 +37,7 @@ CLIENT_SECRET_FILE = "client_secret.json"
 DB_PATH = "scheduler.db"
 
 # Public URL for OAuth redirect. Set in env for production:
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8501").rstrip("/")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://app.agenticdudes.com").rstrip("/")
 
 # -----------------------------
 # Utility: safe rerun
