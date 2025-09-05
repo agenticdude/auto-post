@@ -1,6 +1,0 @@
-.tokens/
-__pycache__/
-.venv/
-*.log
-.DS_Store
-scheduler.db
