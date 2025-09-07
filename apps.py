@@ -23,10 +23,18 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # Configuration
 # -----------------------------
 SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube",
-    "https://www.googleapis.com/auth/calendar.events",
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.photos.readonly',
+    'https://www.googleapis.com/auth/drive.metadata',
+    'https://www.googleapis.com/auth/drive.appdata',
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/youtube',
+    'https://www.googleapis.com/auth/youtube.upload',
+    'https://www.googleapis.com/auth/youtubepartner',
+    'https://www.googleapis.com/auth/youtubepartner-channel-audit',
+    'https://www.googleapis.com/auth/youtube.force-ssl',
+    'https://www.googleapis.com/auth/calendar.events'
 ]
 CLIENT_SECRET_FILE = "client_secret.json"
 # MODIFIED: Use persistent DB path in production
