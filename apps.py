@@ -32,7 +32,7 @@ CLIENT_SECRET_FILE = "client_secret.json"
 # MODIFIED: Use persistent DB path in production
 ENV = os.environ.get("ENV", "dev")
 DB_PATH = "/app/data/scheduler.db" if ENV == "prod" else "scheduler.db"
-APP_URL = os.environ.get("APP_URL", "http://localhost:8501")
+APP_URL = os.environ.get("APP_URL", "https://app.agenticdudes.com/")
 
 # -----------------------------
 # Safe rerun helper
